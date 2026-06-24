@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 
 import '../models/customer.dart';
 import '../services/storage_service.dart';
+import '../widgets/customer_form_dialog.dart';
 import '../widgets/due_summary_card.dart';
 import 'customer_ledger_page.dart';
 
@@ -60,63 +61,23 @@ class _CustomersPageState extends State<CustomersPage> {
   }
 
   Future<void> _addOrEditCustomer([Customer? existing]) async {
-    final nameController = TextEditingController(text: existing?.name ?? '');
-    final phoneController =
-        TextEditingController(text: existing?.whatsappNumber ?? '');
-
-    final saved = await showDialog<bool>(
+    final result = await showDialog<CustomerFormResult>(
       context: context,
-      builder: (context) => AlertDialog(
-        title: Text(existing == null ? 'Add Customer' : 'Edit Customer'),
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            TextField(
-              controller: nameController,
-              decoration: const InputDecoration(
-                labelText: 'Name',
-                border: OutlineInputBorder(),
-              ),
-            ),
-            const SizedBox(height: 12),
-            TextField(
-              controller: phoneController,
-              keyboardType: TextInputType.phone,
-              decoration: const InputDecoration(
-                labelText: 'WhatsApp number',
-                border: OutlineInputBorder(),
-              ),
-            ),
-          ],
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context, false),
-            child: const Text('Cancel'),
-          ),
-          ElevatedButton(
-            onPressed: () => Navigator.pop(context, true),
-            child: const Text('Save'),
-          ),
-        ],
+      builder: (context) => CustomerFormDialog(
+        title: existing == null ? 'Add Customer' : 'Edit Customer',
+        initialName: existing?.name,
+        initialPhone: existing?.whatsappNumber,
       ),
     );
-
-    if (saved != true) return;
-
-    final name = nameController.text.trim();
-    final phone = phoneController.text.trim();
-    if (name.isEmpty || phone.isEmpty) return;
+    if (result == null || !mounted) return;
 
     await _storage.upsertCustomer(
       Customer(
         id: existing?.id ?? DateTime.now().millisecondsSinceEpoch.toString(),
-        name: name,
-        whatsappNumber: phone,
+        name: result.name,
+        whatsappNumber: result.phone,
       ),
     );
-    nameController.dispose();
-    phoneController.dispose();
     await _load();
   }
 

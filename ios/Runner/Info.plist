@@ -49,5 +49,7 @@
 	<true/>
 	<key>NSCameraUsageDescription</key>
 	<string>Camera is used to scan product barcodes for SWG size and weight.</string>
+	<key>NSContactsUsageDescription</key>
+	<string>Contacts are used to quickly add customers from your phone book.</string>
 </dict>
 </plist>

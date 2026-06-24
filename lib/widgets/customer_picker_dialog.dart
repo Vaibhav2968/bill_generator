@@ -1,7 +1,9 @@
 import 'package:flutter/material.dart';
 
 import '../models/customer.dart';
+import '../pages/contact_picker_page.dart';
 import '../services/storage_service.dart';
+import '../utils/contact_utils.dart';
 
 class CustomerPickerDialog extends StatefulWidget {
   const CustomerPickerDialog({super.key});
@@ -55,6 +57,20 @@ class _CustomerPickerDialogState extends State<CustomerPickerDialog> {
         .toList();
   }
 
+  Future<void> _pickFromContacts() async {
+    final contact = await Navigator.of(context, rootNavigator: true)
+        .push<ContactPickResult>(
+      MaterialPageRoute(builder: (context) => const ContactPickerPage()),
+    );
+    if (!mounted || contact == null) return;
+
+    setState(() {
+      _nameController.text = contact.name;
+      _phoneController.text = contact.phone;
+      _showAddForm = true;
+    });
+  }
+
   Future<void> _saveNewCustomer() async {
     final name = _nameController.text.trim();
     final phone = _phoneController.text.trim();
@@ -95,6 +111,12 @@ class _CustomerPickerDialogState extends State<CustomerPickerDialog> {
                   ),
                   const SizedBox(height: 12),
                   if (_showAddForm) ...[
+                    OutlinedButton.icon(
+                      onPressed: _pickFromContacts,
+                      icon: const Icon(Icons.contacts_outlined),
+                      label: const Text('Pick from contacts'),
+                    ),
+                    const SizedBox(height: 8),
                     TextField(
                       controller: _nameController,
                       decoration: const InputDecoration(

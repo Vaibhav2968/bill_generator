@@ -5,6 +5,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import '../models/bill_stock_line.dart';
 import '../models/customer.dart';
 import '../models/ledger_entry.dart';
+import '../models/purchase.dart';
 import '../models/saved_bill.dart';
 import '../models/stock_entry.dart';
 import '../utils/bill_number_utils.dart';
@@ -18,6 +19,8 @@ class StorageService {
   static const _savedBillsKey = 'saved_bills_v1';
   static const _stockEntriesKey = 'stock_entries_v1';
   static const _stockBasePriceKey = 'stock_base_price_v1';
+  static const _purchasesKey = 'purchases_v1';
+  static const _purchasePaymentsKey = 'purchase_payments_v1';
 
   Future<List<Customer>> getCustomers() async {
     final prefs = await SharedPreferences.getInstance();
@@ -332,6 +335,219 @@ class StorageService {
   double totalStockWeight(List<StockSummaryItem> summary) =>
       summary.fold<double>(0, (sum, item) => sum + item.weight);
 
+  double calculateStockValueFromEntries(List<StockEntry> entries) {
+    final summary = buildStockSummary(entries);
+    var total = 0.0;
+    for (final item in summary) {
+      final layers = _buildFifoLayers(entries, item.gauge, item.packing2_5kg);
+      for (final layer in layers) {
+        total +=
+            layer.remaining *
+            GaugeUtils.unitPrice(
+              layer.basePrice,
+              item.gauge,
+              packing2_5kg: item.packing2_5kg,
+            );
+      }
+    }
+    return total;
+  }
+
+  Future<List<Purchase>> getPurchases() async {
+    final prefs = await SharedPreferences.getInstance();
+    final raw = prefs.getString(_purchasesKey);
+    if (raw == null) return [];
+    final list = jsonDecode(raw) as List<dynamic>;
+    return list
+        .map((e) => Purchase.fromJson(e as Map<String, dynamic>))
+        .toList()
+      ..sort((a, b) => b.date.compareTo(a.date));
+  }
+
+  Future<void> _savePurchases(List<Purchase> purchases) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(
+      _purchasesKey,
+      jsonEncode(purchases.map((p) => p.toJson()).toList()),
+    );
+  }
+
+  Future<List<PurchasePayment>> getPurchasePayments() async {
+    final prefs = await SharedPreferences.getInstance();
+    final raw = prefs.getString(_purchasePaymentsKey);
+    if (raw == null) return [];
+    final list = jsonDecode(raw) as List<dynamic>;
+    return list
+        .map((e) => PurchasePayment.fromJson(e as Map<String, dynamic>))
+        .toList();
+  }
+
+  Future<void> _savePurchasePayments(List<PurchasePayment> payments) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(
+      _purchasePaymentsKey,
+      jsonEncode(payments.map((p) => p.toJson()).toList()),
+    );
+  }
+
+  Future<double> getPurchasePaidAmount(String purchaseId) async {
+    final payments = await getPurchasePayments();
+    return payments
+        .where((payment) => payment.purchaseId == purchaseId)
+        .fold<double>(0, (sum, payment) => sum + payment.amount);
+  }
+
+  Future<double> getPurchaseDue(String purchaseId) async {
+    final purchases = await getPurchases();
+    final purchase = purchases.firstWhere((p) => p.id == purchaseId);
+    final paid = await getPurchasePaidAmount(purchaseId);
+    return purchase.totalAmount - paid;
+  }
+
+  Future<double> getTotalPurchaseDue() async {
+    final purchases = await getPurchases();
+    var total = 0.0;
+    for (final purchase in purchases) {
+      final due = await getPurchaseDue(purchase.id);
+      if (due > 0) total += due;
+    }
+    return total;
+  }
+
+  Future<Purchase> savePurchase(Purchase purchase) async {
+    final purchases = await getPurchases();
+    purchases.add(purchase);
+    await _savePurchases(purchases);
+    await _addPurchaseStockEntries(purchase);
+    await setStockBasePrice(purchase.basePrice);
+    return purchase;
+  }
+
+  Future<String?> validatePurchaseCanModify(String purchaseId) async {
+    final entries = await getStockEntries();
+    final purchaseEntries = entries
+        .where(
+          (entry) =>
+              entry.linkedPurchaseId == purchaseId && entry.isIncoming,
+        )
+        .toList();
+
+    for (final inEntry in purchaseEntries) {
+      final batches = getRemainingStockBatches(
+        entries,
+        inEntry.gauge,
+        inEntry.packing2_5kg,
+      );
+      final batch = batches
+          .where((layer) => layer.sourceEntryId == inEntry.id)
+          .firstOrNull;
+      final remaining = batch?.remainingWeight ?? 0;
+      if (remaining < inEntry.weight - 0.001) {
+        final sold = inEntry.weight - remaining;
+        return 'Cannot change this purchase — '
+            '${sold.toStringAsFixed(2)} kg from '
+            '${StockUtils.itemLabel(inEntry.gauge, inEntry.packing2_5kg)} '
+            'has already been sold.';
+      }
+    }
+    return null;
+  }
+
+  Future<void> _addPurchaseStockEntries(Purchase purchase) async {
+    final stockEntries = await getStockEntries();
+    for (var i = 0; i < purchase.lines.length; i++) {
+      final line = purchase.lines[i];
+      final gauge = GaugeUtils.normalizeGauge(line.gauge) ?? line.gauge;
+      stockEntries.add(
+        StockEntry(
+          id: '${purchase.id}_$i',
+          date: purchase.date,
+          gauge: gauge,
+          weight: line.weight,
+          packing2_5kg: line.packing2_5kg,
+          basePrice: purchase.basePrice,
+          type: 'in',
+          source: 'purchase',
+          linkedPurchaseId: purchase.id,
+          note: 'Base Rs. ${purchase.basePrice.round()}',
+        ),
+      );
+    }
+    await _saveStockEntries(stockEntries);
+  }
+
+  Future<void> _removePurchaseStockEntries(String purchaseId) async {
+    final stockEntries = await getStockEntries();
+    stockEntries.removeWhere(
+      (entry) =>
+          entry.linkedPurchaseId == purchaseId && entry.isIncoming,
+    );
+    await _saveStockEntries(stockEntries);
+  }
+
+  Future<void> deletePurchase(String purchaseId) async {
+    final error = await validatePurchaseCanModify(purchaseId);
+    if (error != null) {
+      throw StateError(error);
+    }
+
+    final purchases = await getPurchases();
+    purchases.removeWhere((purchase) => purchase.id == purchaseId);
+    await _savePurchases(purchases);
+
+    final payments = await getPurchasePayments();
+    payments.removeWhere((payment) => payment.purchaseId == purchaseId);
+    await _savePurchasePayments(payments);
+
+    await _removePurchaseStockEntries(purchaseId);
+  }
+
+  Future<Purchase> updatePurchase(Purchase purchase) async {
+    final error = await validatePurchaseCanModify(purchase.id);
+    if (error != null) {
+      throw StateError(error);
+    }
+
+    final purchases = await getPurchases();
+    final index = purchases.indexWhere((item) => item.id == purchase.id);
+    if (index < 0) {
+      throw StateError('Purchase not found');
+    }
+    purchases[index] = purchase;
+    await _savePurchases(purchases);
+
+    await _removePurchaseStockEntries(purchase.id);
+    await _addPurchaseStockEntries(purchase);
+    await setStockBasePrice(purchase.basePrice);
+    return purchase;
+  }
+
+  Future<Purchase?> getPurchaseById(String id) async {
+    final purchases = await getPurchases();
+    return purchases.where((purchase) => purchase.id == id).firstOrNull;
+  }
+
+  Future<void> addPurchasePayment(PurchasePayment payment) async {
+    final payments = await getPurchasePayments();
+    payments.add(payment);
+    await _savePurchasePayments(payments);
+  }
+
+  Future<void> updatePurchasePayment(PurchasePayment payment) async {
+    final payments = await getPurchasePayments();
+    final index = payments.indexWhere((item) => item.id == payment.id);
+    if (index >= 0) {
+      payments[index] = payment;
+      await _savePurchasePayments(payments);
+    }
+  }
+
+  Future<void> deletePurchasePayment(String id) async {
+    final payments = await getPurchasePayments();
+    payments.removeWhere((payment) => payment.id == id);
+    await _savePurchasePayments(payments);
+  }
+
   double totalStockValue(
     List<StockSummaryItem> summary,
     double basePrice,
@@ -362,6 +578,26 @@ class StorageService {
 
     for (final line in lines) {
       final gauge = GaugeUtils.normalizeGauge(line.gauge) ?? line.gauge;
+      if (line.stockSourceEntryId != null) {
+        final batches = getRemainingStockBatches(
+          entries,
+          gauge,
+          line.packing2_5kg,
+        );
+        final batch = batches
+            .where((b) => b.sourceEntryId == line.stockSourceEntryId)
+            .firstOrNull;
+        final available = batch?.remainingWeight ?? 0;
+        if (line.weight > available + 0.001) {
+          shortages.add(
+            '${StockUtils.itemLabel(gauge, line.packing2_5kg)} '
+            '(selected lot): need ${line.weight} kg, '
+            'have ${available.toStringAsFixed(3)} kg',
+          );
+        }
+        continue;
+      }
+
       final available =
           _availableWeight(summary, gauge, line.packing2_5kg);
       if (line.weight > available + 0.001) {
@@ -413,8 +649,11 @@ class StorageService {
       if (entry.isIncoming) {
         layers.add(
           _StockLayer(
+            sourceEntryId: entry.id,
             remaining: entry.weight,
+            originalWeight: entry.weight,
             basePrice: entry.basePrice,
+            date: entry.date,
           ),
         );
         continue;
@@ -431,6 +670,60 @@ class StorageService {
     }
 
     return layers.where((layer) => layer.remaining > 0.001).toList();
+  }
+
+  List<StockBatch> getRemainingStockBatches(
+    List<StockEntry> entries,
+    double gauge,
+    bool packing2_5kg,
+  ) {
+    final normalized = GaugeUtils.normalizeGauge(gauge) ?? gauge;
+    return _buildFifoLayers(entries, normalized, packing2_5kg)
+        .map(
+          (layer) => StockBatch(
+            sourceEntryId: layer.sourceEntryId,
+            remainingWeight: layer.remaining,
+            addedWeight: layer.originalWeight,
+            basePrice: layer.basePrice,
+            date: layer.date,
+          ),
+        )
+        .toList();
+  }
+
+  List<StockBaseBreakdown> getAvailableStockBreakdown(
+    List<StockEntry> entries,
+    double gauge,
+    bool packing2_5kg,
+    double reservedWeight,
+  ) {
+    final batches = getRemainingStockBatches(entries, gauge, packing2_5kg);
+    var toReserve = reservedWeight;
+    final byBase = <double, double>{};
+
+    for (final batch in batches) {
+      var remaining = batch.remainingWeight;
+      if (toReserve > 0.001) {
+        final take =
+            toReserve < remaining ? toReserve : remaining;
+        remaining -= take;
+        toReserve -= take;
+      }
+      if (remaining > 0.001) {
+        byBase[batch.basePrice] = (byBase[batch.basePrice] ?? 0) + remaining;
+      }
+    }
+
+    final breakdown = byBase.entries
+        .map(
+          (entry) => StockBaseBreakdown(
+            basePrice: entry.key,
+            weight: entry.value,
+          ),
+        )
+        .toList();
+    breakdown.sort((a, b) => a.basePrice.compareTo(b.basePrice));
+    return breakdown;
   }
 
   double _averagePurchaseBase(
@@ -453,6 +746,13 @@ class StorageService {
     return totalValue / totalWeight;
   }
 
+  double averagePurchaseBaseForSku(
+    List<StockEntry> entries,
+    double gauge,
+    bool packing2_5kg,
+  ) =>
+      _averagePurchaseBase(entries, gauge, packing2_5kg);
+
   Future<void> deductStockForBill({
     required String linkedBillId,
     required String billNumber,
@@ -466,6 +766,35 @@ class StorageService {
       final gauge = GaugeUtils.normalizeGauge(line.gauge) ?? line.gauge;
       var remaining = line.weight;
       final layers = _buildFifoLayers(entries, gauge, line.packing2_5kg);
+
+      if (line.stockSourceEntryId != null) {
+        final layerIndex = layers.indexWhere(
+          (layer) => layer.sourceEntryId == line.stockSourceEntryId,
+        );
+        if (layerIndex >= 0) {
+          final layer = layers[layerIndex];
+          if (layer.remaining > 0.001) {
+            final take =
+                remaining < layer.remaining ? remaining : layer.remaining;
+            entries.add(
+              StockEntry(
+                id: '${linkedBillId}_${outIndex++}',
+                date: now,
+                gauge: gauge,
+                weight: take,
+                packing2_5kg: line.packing2_5kg,
+                basePrice: layer.basePrice,
+                type: 'out',
+                source: 'bill',
+                note: 'Bill $billNumber',
+                linkedBillId: linkedBillId,
+              ),
+            );
+            layer.remaining -= take;
+            remaining -= take;
+          }
+        }
+      }
 
       for (final layer in layers) {
         if (remaining <= 0.001) break;
@@ -528,11 +857,17 @@ class StorageService {
 }
 
 class _StockLayer {
+  final String sourceEntryId;
   double remaining;
+  final double originalWeight;
   final double basePrice;
+  final DateTime date;
 
   _StockLayer({
+    required this.sourceEntryId,
     required this.remaining,
+    required this.originalWeight,
     required this.basePrice,
+    required this.date,
   });
 }

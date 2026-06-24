@@ -141,8 +141,8 @@ class _ProfitLossPageState extends State<ProfitLossPage> {
                         border: Border.all(color: Colors.blue.shade100),
                       ),
                       child: const Text(
-                        'Profit = bill sales − purchase cost from stock.\n'
-                        'Add stock with your buy rate. Bills use your selling base price.',
+                        'Profit = sale amount − purchase amount (from stock buy rate).\n'
+                        'Each purchase keeps its own base price until sold.',
                       ),
                     ),
                     const SizedBox(height: 20),
@@ -161,7 +161,7 @@ class _ProfitLossPageState extends State<ProfitLossPage> {
                       _buildMetricCard(
                         title: 'Purchase cost (from stock)',
                         value: 'Rs. ${summary.costOfGoodsSold.round()}',
-                        subtitle: 'Based on base price when stock was added',
+                        subtitle: 'Buy rate stored on each purchase batch',
                         icon: Icons.inventory_2_outlined,
                         color: Colors.orange,
                       ),

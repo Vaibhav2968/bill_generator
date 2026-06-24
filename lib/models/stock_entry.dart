@@ -8,9 +8,10 @@ class StockEntry {
   final bool packing2_5kg;
   final double basePrice;
   final String type; // 'in' or 'out'
-  final String source; // 'manual', 'scan', or 'bill'
+  final String source; // 'purchase', 'scan', 'bill', 'manual'
   final String note;
   final String? linkedBillId;
+  final String? linkedPurchaseId;
 
   const StockEntry({
     required this.id,
@@ -23,6 +24,7 @@ class StockEntry {
     this.source = 'manual',
     this.note = '',
     this.linkedBillId,
+    this.linkedPurchaseId,
   });
 
   bool get isIncoming => type == 'in';
@@ -38,6 +40,7 @@ class StockEntry {
         'source': source,
         'note': note,
         'linkedBillId': linkedBillId,
+        'linkedPurchaseId': linkedPurchaseId,
       };
 
   factory StockEntry.fromJson(Map<String, dynamic> json) => StockEntry(
@@ -51,6 +54,7 @@ class StockEntry {
         source: json['source'] as String? ?? 'manual',
         note: json['note'] as String? ?? '',
         linkedBillId: json['linkedBillId'] as String?,
+        linkedPurchaseId: json['linkedPurchaseId'] as String?,
       );
 }
 
@@ -68,4 +72,36 @@ class StockSummaryItem {
   double stockValue(double basePrice) =>
       GaugeUtils.unitPrice(basePrice, gauge, packing2_5kg: packing2_5kg) *
       weight;
+}
+
+class StockBatch {
+  final String sourceEntryId;
+  final double remainingWeight;
+  final double addedWeight;
+  final double basePrice;
+  final DateTime date;
+
+  const StockBatch({
+    required this.sourceEntryId,
+    required this.remainingWeight,
+    required this.addedWeight,
+    required this.basePrice,
+    required this.date,
+  });
+
+  bool get isPartiallyUsed =>
+      remainingWeight < addedWeight - 0.001;
+
+  double buyRate(double gauge, {bool packing2_5kg = false}) =>
+      GaugeUtils.unitPrice(basePrice, gauge, packing2_5kg: packing2_5kg);
+}
+
+class StockBaseBreakdown {
+  final double basePrice;
+  final double weight;
+
+  const StockBaseBreakdown({
+    required this.basePrice,
+    required this.weight,
+  });
 }

@@ -45,6 +45,7 @@ dependencies:
   firebase_auth: ^5.3.0
   cloud_firestore: ^5.4.0
   firebase_core: ^3.6.0
+  flutter_contacts: ^2.2.2
 
 
 

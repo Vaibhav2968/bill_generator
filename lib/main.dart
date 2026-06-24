@@ -16,6 +16,7 @@ import 'models/customer.dart';
 import 'models/bill_stock_line.dart';
 import 'models/ledger_entry.dart';
 import 'models/saved_bill.dart';
+import 'models/stock_entry.dart';
 import 'pages/bill_page.dart';
 import 'pages/customers_page.dart';
 import 'pages/profit_loss_page.dart';
@@ -270,12 +271,16 @@ class BillLineItem {
   final double weight;
   final double amount;
   final bool packing2_5kg;
+  final double? purchaseBasePrice;
+  final String? stockSourceEntryId;
 
   const BillLineItem({
     required this.gauge,
     required this.weight,
     required this.amount,
     this.packing2_5kg = false,
+    this.purchaseBasePrice,
+    this.stockSourceEntryId,
   });
 }
 
@@ -295,6 +300,8 @@ class _ResultPageState extends State<ResultPage> {
   double? selectedGauge;
   double multiplier = 1.0;
   bool selectedPacking2_5kg = false;
+  String? _selectedStockSourceId;
+  double? _selectedPurchaseBase;
 
   TextEditingController multiplierController = TextEditingController();
   final StorageService _storage = StorageService();
@@ -302,12 +309,427 @@ class _ResultPageState extends State<ResultPage> {
   final ScrollController _listViewController = ScrollController();
   final ScrollController _columnViewController = ScrollController();
   bool _showButton = false;
+  List<StockSummaryItem> _stockSummary = [];
+  List<StockEntry> _stockEntries = [];
 
   @override
   void initState() {
     super.initState();
     _columnViewController.addListener(_scrollListener);
+    _loadStock();
   }
+
+  Future<void> _loadStock() async {
+    final entries = await _storage.getStockEntries();
+    if (!mounted) return;
+    setState(() {
+      _stockEntries = entries;
+      _stockSummary = _storage.buildStockSummary(entries);
+    });
+  }
+
+  List<StockBatch> _availableBatchesFor(
+    double gauge,
+    bool packing2_5kg,
+  ) {
+    final normalized = GaugeUtils.normalizeGauge(gauge) ?? gauge;
+    final batches = _storage.getRemainingStockBatches(
+      _stockEntries,
+      normalized,
+      packing2_5kg,
+    );
+    final result = <StockBatch>[];
+    for (final batch in batches) {
+      final reserved = lineItems
+          .where((item) => item.stockSourceEntryId == batch.sourceEntryId)
+          .fold<double>(0, (sum, item) => sum + item.weight);
+      final remaining = batch.remainingWeight - reserved;
+      if (remaining <= 0.001) continue;
+      result.add(
+        StockBatch(
+          sourceEntryId: batch.sourceEntryId,
+          remainingWeight: remaining,
+          addedWeight: batch.addedWeight,
+          basePrice: batch.basePrice,
+          date: batch.date,
+        ),
+      );
+    }
+    return result;
+  }
+
+  List<StockBatch> _selectableBatches() {
+    if (selectedGauge == null) return [];
+    return _availableBatchesFor(selectedGauge!, selectedPacking2_5kg);
+  }
+
+  Future<StockBatch?> _pickStockLot({
+    required double gauge,
+    required bool packing2_5kg,
+    required double requiredWeight,
+  }) async {
+    final batches = _availableBatchesFor(gauge, packing2_5kg);
+    final eligible = batches
+        .where((batch) => batch.remainingWeight >= requiredWeight - 0.001)
+        .toList();
+
+    if (eligible.isEmpty) {
+      final totalAvail = batches.fold<double>(
+        0,
+        (sum, batch) => sum + batch.remainingWeight,
+      );
+      final gaugeLabel = GaugeUtils.formatGaugeLabel(gauge);
+      final packingLabel = packing2_5kg ? ' (2.5kg pack)' : '';
+      final message = totalAvail < requiredWeight - 0.001
+          ? 'Not enough $gaugeLabel swg$packingLabel stock. '
+              'Need ${requiredWeight.toStringAsFixed(3)} kg, '
+              'have ${totalAvail.toStringAsFixed(3)} kg.'
+          : 'No single lot has ${requiredWeight.toStringAsFixed(3)} kg for '
+              '$gaugeLabel swg$packingLabel. Add manually from smaller lots.';
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              message,
+              style: const TextStyle(color: Colors.white),
+            ),
+            backgroundColor: Colors.red,
+            duration: const Duration(seconds: 4),
+          ),
+        );
+      }
+      return null;
+    }
+
+    if (eligible.length == 1) return eligible.first;
+
+    final gaugeLabel = GaugeUtils.formatGaugeLabel(gauge);
+    final packingLabel = packing2_5kg ? ' (2.5kg pack)' : '';
+
+    return showModalBottomSheet<StockBatch>(
+      context: context,
+      isScrollControlled: true,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
+      ),
+      builder: (sheetContext) {
+        return SafeArea(
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(16, 12, 16, 16),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Center(
+                  child: Container(
+                    width: 40,
+                    height: 4,
+                    decoration: BoxDecoration(
+                      color: Colors.grey.shade300,
+                      borderRadius: BorderRadius.circular(2),
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 16),
+                Text(
+                  'Select stock lot',
+                  style: Theme.of(context).textTheme.titleLarge?.copyWith(
+                        fontWeight: FontWeight.bold,
+                      ),
+                  textAlign: TextAlign.center,
+                ),
+                const SizedBox(height: 6),
+                Text(
+                  '$gaugeLabel swg$packingLabel — '
+                  '${requiredWeight.toStringAsFixed(3)} kg scanned',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(
+                    fontSize: 14,
+                    color: Colors.grey.shade700,
+                  ),
+                ),
+                const SizedBox(height: 16),
+                Flexible(
+                  child: ListView.separated(
+                    shrinkWrap: true,
+                    itemCount: eligible.length,
+                    separatorBuilder: (_, __) => const SizedBox(height: 8),
+                    itemBuilder: (context, index) {
+                      final batch = eligible[index];
+                      final buyRate = batch.buyRate(
+                        gauge,
+                        packing2_5kg: packing2_5kg,
+                      );
+                      return Material(
+                        color: Colors.white,
+                        borderRadius: BorderRadius.circular(10),
+                        child: InkWell(
+                          onTap: () =>
+                              Navigator.pop(sheetContext, batch),
+                          borderRadius: BorderRadius.circular(10),
+                          child: Container(
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 12,
+                              vertical: 12,
+                            ),
+                            decoration: BoxDecoration(
+                              borderRadius: BorderRadius.circular(10),
+                              border: Border.all(color: Colors.teal.shade200),
+                            ),
+                            child: Row(
+                              children: [
+                                Icon(
+                                  Icons.inventory_2_outlined,
+                                  color: Colors.teal.shade700,
+                                ),
+                                const SizedBox(width: 12),
+                                Expanded(
+                                  child: Column(
+                                    crossAxisAlignment:
+                                        CrossAxisAlignment.start,
+                                    children: [
+                                      Text(
+                                        '${batch.remainingWeight.toStringAsFixed(2)} kg available',
+                                        style: const TextStyle(
+                                          fontWeight: FontWeight.bold,
+                                          fontSize: 16,
+                                        ),
+                                      ),
+                                      Text(
+                                        'Buy Rs. ${buyRate.round()}/kg '
+                                        '(base ${batch.basePrice.round()})',
+                                        style: const TextStyle(fontSize: 13),
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                                const Icon(Icons.chevron_right),
+                              ],
+                            ),
+                          ),
+                        ),
+                      );
+                    },
+                  ),
+                ),
+              ],
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  void _clearBatchSelection() {
+    _selectedStockSourceId = null;
+    _selectedPurchaseBase = null;
+  }
+
+  void _selectStockBatch(StockBatch batch) {
+    setState(() {
+      _selectedStockSourceId = batch.sourceEntryId;
+      _selectedPurchaseBase = batch.basePrice;
+      multiplier = batch.remainingWeight;
+      multiplierController.text =
+          batch.remainingWeight.toStringAsFixed(3);
+    });
+  }
+
+  double _availableStock(double gauge, {bool packing2_5kg = false}) {
+    final normalized = GaugeUtils.normalizeGauge(gauge) ?? gauge;
+    final inStock = _stockSummary
+        .where(
+          (item) =>
+              item.gauge == normalized && item.packing2_5kg == packing2_5kg,
+        )
+        .fold<double>(0, (sum, item) => sum + item.weight);
+    final reserved = lineItems
+        .where(
+          (item) =>
+              item.gauge == normalized && item.packing2_5kg == packing2_5kg,
+        )
+        .fold<double>(0, (sum, item) => sum + item.weight);
+    final available = inStock - reserved;
+    return available > 0 ? available : 0;
+  }
+
+  double _availableStockForGauge(double gauge) {
+    final normalized = GaugeUtils.normalizeGauge(gauge) ?? gauge;
+    final inStock = _stockSummary
+        .where((item) => item.gauge == normalized)
+        .fold<double>(0, (sum, item) => sum + item.weight);
+    final reserved = lineItems
+        .where((item) => item.gauge == normalized)
+        .fold<double>(0, (sum, item) => sum + item.weight);
+    final available = inStock - reserved;
+    return available > 0 ? available : 0;
+  }
+
+  List<DropdownMenuItem<double>> _gaugeDropdownItemsWithStock() {
+    return GaugeUtils.allGauges.map((gauge) {
+      final label = GaugeUtils.formatGaugeLabel(gauge);
+      final avail = _availableStockForGauge(gauge);
+      final stockSuffix =
+          avail > 0 ? ' — ${avail.toStringAsFixed(2)} kg' : '';
+      return DropdownMenuItem(
+        value: gauge,
+        child: Text(
+          'Gauge $label$stockSuffix',
+          style: TextStyle(
+            fontSize: 16,
+            fontWeight: FontWeight.w600,
+            color: avail > 0 ? Colors.black : Colors.black54,
+          ),
+        ),
+      );
+    }).toList();
+  }
+
+  Widget _buildStockBatchSelector() {
+    if (selectedGauge == null) return const SizedBox.shrink();
+
+    final batches = _selectableBatches();
+    final gaugeLabel = GaugeUtils.formatGaugeLabel(selectedGauge!);
+    final sellRate = GaugeUtils.unitPrice(
+      widget.baseAmount,
+      selectedGauge!,
+      packing2_5kg: selectedPacking2_5kg,
+    );
+
+    if (batches.isEmpty) {
+      return Container(
+        width: double.infinity,
+        margin: const EdgeInsets.only(top: 10),
+        padding: const EdgeInsets.all(12),
+        decoration: BoxDecoration(
+          color: Colors.orange.shade50,
+          borderRadius: BorderRadius.circular(10),
+          border: Border.all(color: Colors.orange.shade200),
+        ),
+        child: Text(
+          'No stock for $gaugeLabel swg',
+          style: TextStyle(
+            fontWeight: FontWeight.w600,
+            color: Colors.orange.shade900,
+          ),
+        ),
+      );
+    }
+
+    final totalAvail = batches.fold<double>(
+      0,
+      (sum, batch) => sum + batch.remainingWeight,
+    );
+
+    return Container(
+      width: double.infinity,
+      margin: const EdgeInsets.only(top: 10),
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: Colors.teal.shade50,
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: Colors.teal.shade200),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            '$gaugeLabel swg — ${totalAvail.toStringAsFixed(3)} kg available',
+            style: TextStyle(
+              fontWeight: FontWeight.bold,
+              color: Colors.teal.shade900,
+            ),
+          ),
+          const SizedBox(height: 4),
+          Text(
+            'Sell: Rs. ${sellRate.round()}/kg — tap a lot to select',
+            style: TextStyle(fontSize: 13, color: Colors.deepPurple.shade700),
+          ),
+          const SizedBox(height: 10),
+          ...batches.map((batch) {
+            final isSelected =
+                _selectedStockSourceId == batch.sourceEntryId;
+            final buyRate = batch.buyRate(
+              selectedGauge!,
+              packing2_5kg: selectedPacking2_5kg,
+            );
+            return Padding(
+              padding: const EdgeInsets.only(bottom: 8),
+              child: Material(
+                color: isSelected
+                    ? Colors.deepPurple.shade100
+                    : Colors.white,
+                borderRadius: BorderRadius.circular(10),
+                child: InkWell(
+                  onTap: () => _selectStockBatch(batch),
+                  borderRadius: BorderRadius.circular(10),
+                  child: Container(
+                    width: double.infinity,
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 12,
+                      vertical: 10,
+                    ),
+                    decoration: BoxDecoration(
+                      borderRadius: BorderRadius.circular(10),
+                      border: Border.all(
+                        color: isSelected
+                            ? Colors.deepPurple
+                            : Colors.teal.shade100,
+                        width: isSelected ? 2 : 1,
+                      ),
+                    ),
+                    child: Row(
+                      children: [
+                        Icon(
+                          isSelected
+                              ? Icons.check_circle
+                              : Icons.inventory_2_outlined,
+                          color: isSelected
+                              ? Colors.deepPurple
+                              : Colors.teal.shade700,
+                          size: 22,
+                        ),
+                        const SizedBox(width: 10),
+                        Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(
+                                '${batch.remainingWeight.toStringAsFixed(2)} kg',
+                                style: const TextStyle(
+                                  fontWeight: FontWeight.bold,
+                                  fontSize: 16,
+                                ),
+                              ),
+                              Text(
+                                'Buy Rs. ${buyRate.round()}/kg '
+                                '(base ${batch.basePrice.round()})',
+                                style: const TextStyle(fontSize: 13),
+                              ),
+                            ],
+                          ),
+                        ),
+                        if (isSelected)
+                          const Text(
+                            'Selected',
+                            style: TextStyle(
+                              fontWeight: FontWeight.bold,
+                              color: Colors.deepPurple,
+                            ),
+                          ),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+            );
+          }),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildStockAvailabilityBanner() => _buildStockBatchSelector();
 
   void _scrollListener() {
     if (_columnViewController.offset >=
@@ -327,6 +749,8 @@ class _ResultPageState extends State<ResultPage> {
     double gauge,
     double weight, {
     bool packing2_5kg = false,
+    double? purchaseBasePrice,
+    String? stockSourceEntryId,
   }) {
     final normalized = GaugeUtils.normalizeGauge(gauge) ?? gauge;
     final calculatedAmount = GaugeUtils.calculateAmount(
@@ -342,6 +766,8 @@ class _ResultPageState extends State<ResultPage> {
           weight: weight,
           amount: calculatedAmount,
           packing2_5kg: packing2_5kg,
+          purchaseBasePrice: purchaseBasePrice,
+          stockSourceEntryId: stockSourceEntryId,
         ),
       );
     });
@@ -373,20 +799,54 @@ class _ResultPageState extends State<ResultPage> {
       return;
     }
 
+    if (_selectedStockSourceId != null) {
+      final selectedBatch = _selectableBatches()
+          .where((batch) => batch.sourceEntryId == _selectedStockSourceId)
+          .firstOrNull;
+      if (selectedBatch == null) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text(
+              'Selected stock lot is no longer available',
+              style: TextStyle(color: Colors.white),
+            ),
+            backgroundColor: Colors.red,
+          ),
+        );
+        return;
+      }
+      if (multiplier > selectedBatch.remainingWeight + 0.001) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              'Only ${selectedBatch.remainingWeight.toStringAsFixed(3)} kg '
+              'left in this lot',
+              style: const TextStyle(color: Colors.white),
+            ),
+            backgroundColor: Colors.red,
+          ),
+        );
+        return;
+      }
+    }
+
     _addLineItem(
       selectedGauge!,
       multiplier,
       packing2_5kg: selectedPacking2_5kg,
+      purchaseBasePrice: _selectedPurchaseBase,
+      stockSourceEntryId: _selectedStockSourceId,
     );
     setState(() {
       selectedGauge = null;
       multiplier = 1.0;
       selectedPacking2_5kg = false;
       multiplierController.text = '';
+      _clearBatchSelection();
     });
   }
 
-  void _addFromScan(ScanProductData data) {
+  Future<bool> _addFromScan(ScanProductData data) async {
     final gauge = GaugeUtils.normalizeGauge(data.size);
     if (gauge == null) {
       ScaffoldMessenger.of(context).showSnackBar(
@@ -398,14 +858,24 @@ class _ResultPageState extends State<ResultPage> {
           backgroundColor: Colors.red,
         ),
       );
-      return;
+      return false;
     }
+
+    final batch = await _pickStockLot(
+      gauge: gauge,
+      packing2_5kg: data.packing2_5kg,
+      requiredWeight: data.netWeight,
+    );
+    if (!mounted || batch == null) return false;
 
     _addLineItem(
       gauge,
       data.netWeight,
       packing2_5kg: data.packing2_5kg,
+      purchaseBasePrice: batch.basePrice,
+      stockSourceEntryId: batch.sourceEntryId,
     );
+    return true;
   }
 
   void _removeLineItem(int index) {
@@ -553,6 +1023,8 @@ class _ResultPageState extends State<ResultPage> {
             weight: weight,
             amount: amount,
             packing2_5kg: editPacking,
+            purchaseBasePrice: item.purchaseBasePrice,
+            stockSourceEntryId: item.stockSourceEntryId,
           );
         });
       }
@@ -570,6 +1042,8 @@ class _ResultPageState extends State<ResultPage> {
             gauge: item.gauge,
             weight: item.weight,
             packing2_5kg: item.packing2_5kg,
+            purchaseBasePrice: item.purchaseBasePrice,
+            stockSourceEntryId: item.stockSourceEntryId,
           ),
         )
         .toList();
@@ -623,14 +1097,19 @@ class _ResultPageState extends State<ResultPage> {
     );
     if (!mounted || data == null) return;
 
-    _addFromScan(data);
+    final added = await _addFromScan(data);
+    if (!mounted || !added) return;
+
     final packingNote =
         data.packing2_5kg ? ' | 2.5kg pack' : '';
+    final lotNote = lineItems.last.purchaseBasePrice != null
+        ? ' | lot base Rs. ${lineItems.last.purchaseBasePrice!.round()}'
+        : '';
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(
         content: Text(
           'Added SWG ${GaugeUtils.formatGaugeLabel(data.size)} | '
-          '${data.netWeight} kg$packingNote',
+          '${data.netWeight} kg$packingNote$lotNote',
           style: const TextStyle(color: Colors.white),
         ),
         backgroundColor: Colors.teal.shade700,
@@ -693,13 +1172,16 @@ class _ResultPageState extends State<ResultPage> {
                 onChanged: (double? value) {
                   setState(() {
                     selectedGauge = value;
+                    _clearBatchSelection();
+                    multiplier = 1.0;
+                    multiplierController.text = '';
                     if (value == null ||
                         !GaugeUtils.supportsPacking2_5kg(value)) {
                       selectedPacking2_5kg = false;
                     }
                   });
                 },
-                items: GaugeUtils.gaugeDropdownItems(),
+                items: _gaugeDropdownItemsWithStock(),
                 style: const TextStyle(
                   fontSize: 16,
                   fontWeight: FontWeight.bold,
@@ -718,6 +1200,7 @@ class _ResultPageState extends State<ResultPage> {
                   color: Colors.black,
                 ),
               ),
+              _buildStockAvailabilityBanner(),
               if (selectedGauge != null &&
                   GaugeUtils.supportsPacking2_5kg(selectedGauge!))
                 CheckboxListTile(
@@ -726,11 +1209,19 @@ class _ResultPageState extends State<ResultPage> {
                     '2.5 kg packing (+Rs. 5/kg)',
                     style: TextStyle(fontWeight: FontWeight.w600),
                   ),
-                  subtitle: const Text('For gauge 20, 21, 22, 23, 24, 25, 26'),
+                  subtitle: Text(
+                    selectedPacking2_5kg
+                        ? 'Available 2.5kg pack: '
+                            '${_availableStock(selectedGauge!, packing2_5kg: true).toStringAsFixed(3)} kg'
+                        : 'For gauge 20, 21, 22, 23, 24, 25, 26',
+                  ),
                   value: selectedPacking2_5kg,
                   onChanged: (value) {
                     setState(() {
                       selectedPacking2_5kg = value ?? false;
+                      _clearBatchSelection();
+                      multiplier = 1.0;
+                      multiplierController.text = '';
                     });
                   },
                   controlAffinity: ListTileControlAffinity.leading,
@@ -885,7 +1376,8 @@ class _ResultPageState extends State<ResultPage> {
                       subtitle: Text(
                         'Price: ₹${gaugeprice.round()} | '
                         'Weight: ${item.weight} kg | '
-                        'Amount: Rs. ${item.amount.round()}',
+                        'Amount: Rs. ${item.amount.round()}'
+                        '${item.purchaseBasePrice != null ? '\nStock lot: buy base Rs. ${item.purchaseBasePrice!.round()}' : ''}',
                         style: const TextStyle(fontSize: 14),
                       ),
                       trailing: Row(
